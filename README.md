@@ -102,6 +102,10 @@ stereo_result['metrics']
 
 ##### Generate counterfactual responses and compute metrics
 We can generate counterfactual responses with `CounterfactualGenerator`.
+Gendered possessives are substituted context-sensitively: `his`/`her` used as
+a determiner ("his car") map to `her`/`his`, while pronoun uses ("that car is
+his", "proud of her") map to `hers`/`him`, so counterfactuals stay
+grammatical (see [CHANGELOG.md](CHANGELOG.md)).
 ```python
 from langfair.generator.counterfactual import CounterfactualGenerator
 cg = CounterfactualGenerator(langchain_llm=llm)
