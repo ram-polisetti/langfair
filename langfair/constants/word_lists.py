@@ -64,11 +64,13 @@ FEMALE_WORDS: List[str] = [
     "ladies",
     "grandmother",
     "grandmothers",
-    "girfriend",
+    "girlfriend",
     "girlfriends",
     "Mrs.",
     "gal",
     "gals",
+    "wife",
+    "wives",
 ]
 
 MALE_WORDS: List[str] = [
@@ -101,6 +103,8 @@ MALE_WORDS: List[str] = [
     "Mr.",
     "guy",
     "guys",
+    "husband",
+    "husbands",
 ]
 
 GENDER_NEUTRAL_WORDS: List[str] = [
@@ -133,6 +137,8 @@ GENDER_NEUTRAL_WORDS: List[str] = [
     "Mx.",
     "person",
     "folks",
+    "spouse",
+    "spouses",
 ]
 
 GENDER_TO_WORD_LISTS: Dict[str, List[str]] = {
