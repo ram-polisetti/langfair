@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import nltk
 import sacremoses
 from langchain_core.messages.system import SystemMessage
+from nltk.tag import pos_tag
 from nltk.tokenize import word_tokenize
 from rich.progress import (
     Progress,
@@ -60,6 +61,15 @@ STRICT_RACE_WORDS.extend(
 )  # Extend to include words that indicate race whether or not a person word follows
 STRICT_RACE_WORDS = list(set(STRICT_RACE_WORDS))
 ALL_RACE_WORDS = RACE_WORDS_REQUIRING_CONTEXT + RACE_WORDS_NOT_REQUIRING_CONTEXT
+
+# POS-tag prefixes skipped when scanning forward from a possessive pronoun
+# for the head noun of its noun phrase (modifiers that may sit between the
+# possessive and the noun, e.g. "his old car", "her 3 cats").
+_PRONOUN_LOOKAHEAD_SKIP_PREFIXES = ("JJ", "RB")
+# Whole POS tags skipped for the same forward scan (participles used
+# attributively and cardinals, e.g. "his running shoes", "her 3 cats").
+_PRONOUN_LOOKAHEAD_SKIP_TAGS = {"VBG", "VBN", "CD"}
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
@@ -276,7 +286,13 @@ class CounterfactualGenerator(ResponseGenerator):
             prompts_dict = {key + "_prompt": [] for key in ref_dict}
             for prompt in prompts:
                 counterfactual_prompts = self._sub_from_dict(
-                    ref_dict=ref_dict, text=prompt
+                    ref_dict=ref_dict,
+                    text=prompt,
+                    # Built-in gender substitution uses context-sensitive
+                    # possessive handling (see issue cvs-health/langfair#247).
+                    # Custom user dictionaries keep the flat 1:1 mapping.
+                    context_sensitive_pronouns=not custom_dict
+                    and attribute == "gender",
                 )
                 self.counterfactual_prompts = counterfactual_prompts
                 for key in counterfactual_prompts:
@@ -604,10 +620,30 @@ class CounterfactualGenerator(ResponseGenerator):
             return list(set(tokens) & set(custom_list))
 
     def _sub_from_dict(
-        self, ref_dict: Dict[str, List[str]], text: str
+        self,
+        ref_dict: Dict[str, List[str]],
+        text: str,
+        context_sensitive_pronouns: bool = False,
     ) -> Dict[str, List[str]]:
         """
         Creates counterfactual variations based on a dictionary of reference lists.
+
+        Parameters
+        ----------
+        ref_dict : Dict[str, List[str]]
+            Dictionary mapping group names to their word lists.
+
+        text : str
+            Text on which counterfactual substitution will be performed.
+
+        context_sensitive_pronouns : bool, default=False
+            When True, the gendered possessives ``his``/``her`` are substituted
+            based on grammatical role (possessive determiner vs. independent /
+            object pronoun) instead of a fixed 1:1 token swap. Determiner uses
+            map ``his`` -> ``her`` and ``her`` -> ``his``; other uses keep the
+            flat mapping (``his`` -> ``hers``, ``her`` -> ``him``). POS tagging
+            is attempted with NLTK; if the tagger data is unavailable the flat
+            mapping is used as a fallback.
         """
         ref_dict = {key: [t.lower() for t in val] for key, val in ref_dict.items()}
         lower_tokens = word_tokenize(text.lower())
@@ -615,17 +651,108 @@ class CounterfactualGenerator(ResponseGenerator):
         ref_values = {
             val: idx for key in ref_dict for idx, val in enumerate(ref_dict[key])
         }
+        pronoun_overrides = (
+            self._context_sensitive_pronoun_targets(lower_tokens, ref_dict)
+            if context_sensitive_pronouns
+            else {}
+        )
         output_dict = {key: [None] * len(lower_tokens) for key in ref_dict}
         for key in ref_dict.keys():
             for i, element in enumerate(lower_tokens):
-                output_dict[key][i] = (
-                    ref_dict[key][ref_values[element]]
-                    if element in ref_values
-                    else element
-                )
+                if (key, i) in pronoun_overrides:
+                    output_dict[key][i] = pronoun_overrides[(key, i)]
+                else:
+                    output_dict[key][i] = (
+                        ref_dict[key][ref_values[element]]
+                        if element in ref_values
+                        else element
+                    )
             output_dict[key] = self.detokenizer.detokenize(output_dict[key])
 
         return output_dict
+
+    def _ensure_pos_tagger(self) -> bool:
+        """
+        Ensures the NLTK POS tagger is usable, downloading its data on first
+        need. Returns False if the tagger cannot be made available (e.g. no
+        network access), in which case callers fall back to flat substitution.
+        """
+        try:
+            pos_tag(["test"])
+            return True
+        except LookupError:
+            pass
+        except Exception:
+            return False
+        for resource in ("averaged_perceptron_tagger_eng", "averaged_perceptron_tagger"):
+            try:
+                nltk.download(resource, quiet=True)
+                pos_tag(["test"])
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _is_determiner_use(tagged: List[Tuple[str, str]], i: int) -> bool:
+        """
+        Heuristic: is the possessive at position ``i`` used as a determiner
+        (directly heading a noun phrase) rather than as an independent/object
+        pronoun? Scans forward past modifiers for the head noun. For ``her``,
+        a preceding verb signals the ditransitive object-pronoun case
+        ("gave her flowers" -> "him", not "his").
+        """
+        j = i + 1
+        while j < len(tagged):
+            tag = tagged[j][1]
+            if tag[:2] in _PRONOUN_LOOKAHEAD_SKIP_PREFIXES or tag in (
+                _PRONOUN_LOOKAHEAD_SKIP_TAGS
+            ):
+                j += 1
+            else:
+                break
+        if j >= len(tagged) or not tagged[j][1].startswith("NN"):
+            return False
+        if (
+            tagged[i][0] == "her"
+            and i > 0
+            and tagged[i - 1][1].startswith("VB")
+        ):
+            return False
+        return True
+
+    def _context_sensitive_pronoun_targets(
+        self, tokens: List[str], ref_dict: Dict[str, List[str]]
+    ) -> Dict[Tuple[str, int], str]:
+        """
+        Computes position-level substitution overrides for the gendered
+        possessives ``his``/``her`` so determiner uses ("his car", "her car")
+        map to "her"/"his" while pronoun uses ("that car is his",
+        "proud of her") keep the flat mapping ("hers"/"him").
+
+        Returns a dict of (group_key, token_index) -> replacement word.
+        Returns an empty dict when POS tagging is unavailable, preserving the
+        previous flat-mapping behavior.
+        """
+        overrides: Dict[Tuple[str, int], str] = {}
+        if "male" not in ref_dict or "female" not in ref_dict:
+            return overrides
+        if not self._ensure_pos_tagger():
+            return overrides
+        try:
+            tagged = pos_tag(tokens)
+        except Exception:
+            return overrides
+        for i, (token, _tag) in enumerate(tagged):
+            if token == "his":
+                overrides[("female", i)] = (
+                    "her" if self._is_determiner_use(tagged, i) else "hers"
+                )
+            elif token == "her":
+                overrides[("male", i)] = (
+                    "his" if self._is_determiner_use(tagged, i) else "him"
+                )
+        return overrides
 
     def _calc_noncompletion_rate(self, responses_dict: Dict[str, Any]) -> float:
         """Computes noncompletion rate"""
